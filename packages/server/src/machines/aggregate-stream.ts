@@ -15,6 +15,7 @@
  */
 import { HEARTBEAT_MS } from "../http/sse.js";
 import { formatSseEvent } from "../socket/sse-text.js";
+import { sseTap } from "../socket/sse-tap.js";
 import { SUBSCRIBER_HIGH_WATER_BYTES } from "./event-hub.js";
 import type { MachineEventHub } from "./event-hub.js";
 import type { MachineSocketTarget } from "./machine-sockets.js";
@@ -52,6 +53,9 @@ export function machineEventsStream(
   log: (line: string) => void = () => undefined,
   options: AggregateOptions = {},
 ): Response {
+  // Tapped when this stream rides the socket (socket/sse-tap.ts): captured once here — the
+  // hub's callbacks fire in the machine's context, the beat's in a timer's.
+  const tap = sseTap();
   const encoder = new TextEncoder();
   const highWater = options.highWaterBytes ?? SUBSCRIBER_HIGH_WATER_BYTES;
   // Grows as machines join: the aggregate reads it on every event, so a machine is heard from
@@ -83,6 +87,10 @@ export function machineEventsStream(
   /** Writes one frame. The aggregate's buffer already holds what is replay material, so nothing is buffered here. */
   const write = (event: string, data: string, id: string | null): void => {
     if (ended || controller === null) return;
+    if (tap !== null) {
+      tap.event({ event, eventId: id, data });
+      return;
+    }
     controller.enqueue(encoder.encode(formatSseEvent({ id, event, data })));
     if (controller.desiredSize !== null && controller.desiredSize <= 0) {
       // This tab has stopped consuming: it is ended and re-issues with its last event id rather

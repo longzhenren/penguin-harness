@@ -26,6 +26,7 @@
  * that machine behind it.
  */
 import { formatSseEvent } from "../socket/sse-text.js";
+import { sseTap } from "../socket/sse-tap.js";
 import {
   MachineEventHub,
   STREAM_OPEN_TIMEOUT_MS,
@@ -132,6 +133,9 @@ export class MachineSocketRelay {
    * what a stream that never opened means for its transport.
    */
   #respond(machineId: string, begin: (sink: Sink) => () => void): Promise<Response> {
+    // Tapped when the caller is the socket transport (socket/sse-tap.ts): captured once
+    // here — a machine's frames arrive in the socket's own context.
+    const tap = sseTap();
     return new Promise<Response>((resolve) => {
       let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
       let ended = false;
@@ -180,6 +184,10 @@ export class MachineSocketRelay {
         },
         onEvent: (event) => {
           if (ended || controller === null) return;
+          if (tap !== null) {
+            tap.event({ event: event.event, eventId: event.eventId, data: event.data });
+            return;
+          }
           controller.enqueue(
             encoder.encode(
               formatSseEvent({ id: event.eventId, event: event.event, data: event.data }),

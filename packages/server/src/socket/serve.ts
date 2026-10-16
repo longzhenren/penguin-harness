@@ -13,9 +13,9 @@
  * (Http.fetchAs) — no credential travels with a frame, and there is nothing in a frame to
  * forge.
  *
- * A `text/event-stream` Response is read to its end and re-framed per event (the SSE
- * heartbeat comments are dropped — the socket pings on its own); a cancel frame, the socket
- * closing, or the client lagging past HIGH_WATER aborts the Request, which is how the
+ * A `text/event-stream` Response is re-framed per event, each handed over as the frame it
+ * already is (sse-tap.ts): no SSE text is written or parsed on this transport. A cancel frame,
+ * the socket closing, or the client lagging past HIGH_WATER aborts the Request, which is how the
  * endpoint's own subscription is released. Everything else is a one-shot frame. Sign-in and
  * the upgrade channel answer 421 — a cookie cannot be set on a socket answer, and a push must
  * not ride the transport it replaces — as does anything the platform declines: the client
@@ -26,7 +26,7 @@ import { sessionKindPath } from "../api/types.js";
 import { declined } from "../hmr/hono-seam.js";
 import { CALL_HEADERS, parseClientFrame } from "./frames.js";
 import type { CallFrame, ServerFrame } from "./frames.js";
-import { SseParser } from "./sse-text.js";
+import { SseTap, withSseTap } from "./sse-tap.js";
 
 /** Same cadence as the SSE heartbeat: a peer that answers no ping within two beats is gone. */
 export const HEARTBEAT_MS = 20_000;
@@ -163,15 +163,20 @@ export function serveApiSocket(ws: WebSocket, deps: ApiSocketDeps): void {
       headers["content-type"] ??= "application/json";
     }
 
+    // The endpoint runs inside the tap's context and hands its events to it in place of
+    // writing SSE text (sse-tap.ts).
+    const tap = new SseTap();
     let res: Response;
     try {
-      res = await deps.fetch(
-        new Request(new URL(call.path, deps.origin), {
-          method: call.method,
-          headers,
-          ...(body !== undefined ? { body } : {}),
-          signal: controller.signal,
-        }),
+      res = await withSseTap(tap, () =>
+        deps.fetch(
+          new Request(new URL(call.path, deps.origin), {
+            method: call.method,
+            headers,
+            ...(body !== undefined ? { body } : {}),
+            signal: controller.signal,
+          }),
+        ),
       );
     } catch (err) {
       if (controller.signal.aborted) return;
@@ -190,7 +195,7 @@ export function serveApiSocket(ws: WebSocket, deps: ApiSocketDeps): void {
     }
 
     const type = res.headers.get("content-type") ?? "";
-    if (type.startsWith("text/event-stream")) return stream(id, res, controller);
+    if (type.startsWith("text/event-stream")) return stream(id, call.path, res, controller, tap);
 
     // One-shot: JSON parsed, text as text, an empty body as null. A body of another kind
     // (a download) does not ride this transport — the client falls back to HTTP on 415.
@@ -218,19 +223,41 @@ export function serveApiSocket(ws: WebSocket, deps: ApiSocketDeps): void {
     send({ id, status: res.status, headers: responseHeaders(res), body: parsed });
   }
 
-  async function stream(id: number, res: Response, controller: AbortController): Promise<void> {
+  /**
+   * A streaming answer, re-framed per event: the endpoint tapped its events across
+   * (sse-tap.ts), so nothing is parsed here. The empty body's close is the stream's end;
+   * cancelling it (a cancel frame, the socket closing, the lagging rule) releases the
+   * endpoint's own subscription.
+   */
+  async function stream(
+    id: number,
+    path: string,
+    res: Response,
+    controller: AbortController,
+    tap: SseTap,
+  ): Promise<void> {
     send({ id, status: res.status, stream: true, headers: responseHeaders(res) });
     const reader = res.body?.getReader();
     if (!reader) return send({ id, end: true, reason: "closed" });
     const stop = () => reader.cancel().catch(() => undefined);
     controller.signal.addEventListener("abort", stop, { once: true });
-    const parser = new SseParser();
-    const decoder = new TextDecoder();
     let reason: string | undefined = "closed";
     try {
+      void reader.read().then(
+        (read) => {
+          if (!read.done) {
+            // Bytes are a stream this server's own endpoints did not tap — a plain-HTTP
+            // forward, a writer of its own. Not parsed: said so, and the stream is over.
+            deps.log(`[socket] stream ${path} answered SSE text rather than events; ending it`);
+            void stop();
+          }
+          tap.seal();
+        },
+        () => tap.seal(),
+      );
       for (;;) {
-        const { value, done } = await reader.read();
-        if (done) break;
+        const event = await tap.next();
+        if (event === null) break;
         if (ws.bufferedAmount > HIGH_WATER_BYTES) {
           // Fast-forward, never buffer without bound: the client re-issues the call with
           // its last event id and the endpoint's own buffer fills the gap (or says resync).
@@ -238,13 +265,8 @@ export function serveApiSocket(ws: WebSocket, deps: ApiSocketDeps): void {
           await stop();
           break;
         }
-        for (const event of parser.feed(decoder.decode(value, { stream: true }))) {
-          send({ id, event: event.event, eventId: event.id, data: event.data });
-        }
-      }
-      const last = parser.flush();
-      if (last !== null && reason === "closed") {
-        send({ id, event: last.event, eventId: last.id, data: last.data });
+        if (controller.signal.aborted) break;
+        send({ id, event: event.event, eventId: event.eventId, data: event.data });
       }
     } catch {
       // The reader was cancelled (our abort) or the endpoint failed; either way the stream is over.
